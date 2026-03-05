@@ -1,13 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::fs;
-use std::io::BufReader;
 use std::path::PathBuf;
 
 use raspars_core::bundle;
 use raspars_core::compress::compress_columns;
 use raspars_core::decompress::decompress_archive;
-use raspars_formats::cargo_lock;
+use raspars_formats::lockfiles::cargo_lock::CargoLock;
+use raspars_formats::lockfiles::format::LockfileFormat;
 
 #[derive(Parser)]
 #[command(name = "raspars")]
@@ -22,22 +22,16 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Compress { input, output } => {
-            let file = fs::File::open(&input)?;
-            let lock = cargo_lock::parse(BufReader::new(file))?;
-            let compressed = compress_columns(
-                &lock.header,
-                &lock.names,
-                &lock.versions,
-                &lock.sources,
-                &lock.checksums,
-                &lock.dependencies,
-            )?;
+            let data = fs::read(&input)?;
+            let columns = CargoLock::parse_to_columns(&data)?;
+            let compressed = compress_columns(&columns)?;
             let bundled = bundle::bundle(&compressed)?;
             fs::write(&output, bundled)?;
         }
         Commands::Decompress { input, output } => {
             let data = fs::read(&input)?;
-            let reconstructed = decompress_archive(&data)?;
+            let columns = decompress_archive(&data)?;
+            let reconstructed = CargoLock::reconstruct(columns)?;
             fs::write(&output, reconstructed)?;
         }
     }
