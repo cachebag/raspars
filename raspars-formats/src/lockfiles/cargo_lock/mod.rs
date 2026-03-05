@@ -260,7 +260,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    const FIXTURE: &str = include_str!("../../../tests/fixtures/Cargo.lock");
+    const FIXTURE: &str = include_str!("../../../tests/fixtures/rustup/Cargo.lock");
 
     fn fixture_streams() -> CargoLockStreams {
         parse(Cursor::new(FIXTURE)).unwrap()
