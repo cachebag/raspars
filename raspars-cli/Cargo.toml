@@ -6,3 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+raspars-core = { path = "../raspars-core/" }
+raspars-formats = { path = "../raspars-formats/" }
+clap.workspace = true
+anyhow.workspace = true
