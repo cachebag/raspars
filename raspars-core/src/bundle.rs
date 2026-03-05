@@ -1,47 +1,60 @@
-use crate::compress::{CompressedStream, CompressedStreams};
+use crate::compress::CompressedBundle;
 
-/// Bundle a collection of compressed streams into a single byte vector.
-pub fn bundle(streams: &CompressedStreams) -> Result<Vec<u8>, BundleError> {
-    let count = streams.streams.len();
+/// Bundle a compressed column set into a single byte vector.
+///
+/// Format (v3 — single-stream):
+///   [MAGIC 4B] [VERSION 1B] [segment_count u32 LE]
+///   [compressed_len u64 LE] [original_len u64 LE]
+///   for each segment:
+///     [kind u8] [label_len u8] [label ...] [offset u64 LE] [len u64 LE]
+///   [compressed data ...]
+pub fn bundle(compressed: &CompressedBundle) -> Result<Vec<u8>, BundleError> {
+    let count = compressed.segments.len();
 
-    // Calculate header size dynamically since labels are variable length
     let header_size = HEADER_BASE_LEN
-        + streams
-            .streams
+        + compressed
+            .segments
             .iter()
-            .map(|s| {
-                // kind + label_len + label + original_len + offset + compressed_len
-                1 + 1 + s.label.len() + 8 + 8 + 8
-            })
+            .map(|s| 1 + 1 + s.label.len() + 8 + 8)
             .sum::<usize>();
 
-    let total_data: usize = streams.streams.iter().map(|s| s.data.len()).sum();
-    let mut buf = Vec::with_capacity(header_size + total_data);
+    let mut buf = Vec::with_capacity(header_size + compressed.data.len());
 
     buf.extend_from_slice(MAGIC);
     buf.push(FORMAT_VERSION);
     buf.extend_from_slice(&(count as u32).to_le_bytes());
+    buf.extend_from_slice(&(compressed.data.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&(compressed.original_len as u64).to_le_bytes());
 
-    let mut data_offset = header_size as u64;
-    for s in &streams.streams {
-        buf.push(s.kind as u8);
-        buf.push(s.label.len() as u8);
-        buf.extend_from_slice(s.label.as_bytes());
-        buf.extend_from_slice(&(s.original_len as u64).to_le_bytes());
-        buf.extend_from_slice(&data_offset.to_le_bytes());
-        buf.extend_from_slice(&(s.data.len() as u64).to_le_bytes());
-        data_offset += s.data.len() as u64;
+    for seg in &compressed.segments {
+        buf.push(seg.kind as u8);
+        buf.push(seg.label.len() as u8);
+        buf.extend_from_slice(seg.label.as_bytes());
+        buf.extend_from_slice(&(seg.offset as u64).to_le_bytes());
+        buf.extend_from_slice(&(seg.len as u64).to_le_bytes());
     }
 
-    for s in &streams.streams {
-        buf.extend_from_slice(&s.data);
-    }
+    buf.extend_from_slice(&compressed.data);
 
     Ok(buf)
 }
 
-/// Unbundle a byte vector into a collection of compressed streams.
-pub fn unbundle(data: &[u8]) -> Result<CompressedStreams, BundleError> {
+/// Metadata for a column segment within the decompressed buffer.
+pub struct SegmentMeta {
+    pub label: String,
+    pub kind: ColumnKind,
+    pub offset: usize,
+    pub len: usize,
+}
+
+/// Result of unbundling: segment metadata + the single compressed blob.
+pub struct UnbundledArchive {
+    pub segments: Vec<SegmentMeta>,
+    pub compressed_data: Vec<u8>,
+}
+
+/// Unbundle a byte vector into segment metadata and the compressed data blob.
+pub fn unbundle(data: &[u8]) -> Result<UnbundledArchive, BundleError> {
     if data.len() < HEADER_BASE_LEN {
         return Err(BundleError::TooShort);
     }
@@ -53,9 +66,11 @@ pub fn unbundle(data: &[u8]) -> Result<CompressedStreams, BundleError> {
     }
 
     let count = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
+    let compressed_len = u64::from_le_bytes(data[9..17].try_into().unwrap()) as usize;
+    let _original_len = u64::from_le_bytes(data[17..25].try_into().unwrap()) as usize;
 
-    let mut streams = Vec::with_capacity(count);
     let mut pos = HEADER_BASE_LEN;
+    let mut segments = Vec::with_capacity(count);
 
     for _ in 0..count {
         if pos >= data.len() {
@@ -75,28 +90,32 @@ pub fn unbundle(data: &[u8]) -> Result<CompressedStreams, BundleError> {
             .map_err(|_| BundleError::InvalidLabel)?;
         pos += label_len;
 
-        let original_len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-
-        let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-
-        let compressed_len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-
-        if data.len() < offset + compressed_len {
+        if pos + 16 > data.len() {
             return Err(BundleError::TooShort);
         }
+        let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        let len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
 
-        streams.push(CompressedStream {
+        segments.push(SegmentMeta {
             label,
             kind,
-            original_len,
-            data: data[offset..offset + compressed_len].to_vec(),
+            offset,
+            len,
         });
     }
 
-    Ok(CompressedStreams { streams })
+    if data.len() < pos + compressed_len {
+        return Err(BundleError::TooShort);
+    }
+
+    let compressed_data = data[pos..pos + compressed_len].to_vec();
+
+    Ok(UnbundledArchive {
+        segments,
+        compressed_data,
+    })
 }
 
 /// An error that can occur while bundling or unbundling streams.
@@ -137,10 +156,10 @@ impl ColumnKind {
 
 /// The magic bytes for a bundle.
 const MAGIC: &[u8; 4] = b"RSPR";
-/// The format version for a bundle.
-const FORMAT_VERSION: u8 = 2;
-/// The base length of a header in a bundle.
-const HEADER_BASE_LEN: usize = 4 + 1 + 4;
+/// The format version for a bundle (v3 = single-stream).
+const FORMAT_VERSION: u8 = 3;
+/// Base header length: magic(4) + version(1) + count(4) + compressed_len(8) + original_len(8).
+const HEADER_BASE_LEN: usize = 4 + 1 + 4 + 8 + 8;
 
 #[cfg(test)]
 mod tests {
@@ -153,28 +172,26 @@ mod tests {
         let columns = construct_column_set();
         let compressed = compress_columns(&columns).unwrap();
         let bundled = bundle(&compressed).unwrap();
-        let recovered = unbundle(&bundled).unwrap();
+        let archive = unbundle(&bundled).unwrap();
 
-        assert_eq!(recovered.streams.len(), compressed.streams.len());
-        for (orig, rec) in compressed.streams.iter().zip(recovered.streams.iter()) {
-            assert_eq!(orig.label, rec.label);
-            assert_eq!(orig.original_len, rec.original_len);
-            assert_eq!(orig.data, rec.data);
-        }
+        assert_eq!(archive.segments.len(), compressed.segments.len());
 
-        let names_stream = recovered
-            .streams
+        let decompressed = decompress_bytes(&archive.compressed_data).unwrap();
+
+        let names_seg = archive
+            .segments
             .iter()
             .find(|s| s.label == "names")
             .unwrap();
-        let rec_names = deserialize_strings(&decompress_bytes(&names_stream.data).unwrap());
+        let raw_names = &decompressed[names_seg.offset..names_seg.offset + names_seg.len];
+        let rec_names = deserialize_strings(raw_names);
         assert_eq!(rec_names, vec!["serde", "tokio", "anyhow", "clap"]);
     }
 
     #[test]
     fn rejects_bad_magic() {
         assert!(matches!(
-            unbundle(b"NOPE\x01\x00\x00\x00\x00"),
+            unbundle(b"NOPE\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
             Err(BundleError::BadMagic)
         ));
     }
@@ -187,16 +204,17 @@ mod tests {
     #[test]
     fn rejects_unsupported_version() {
         assert!(matches!(
-            unbundle(b"RSPR\xFF\x00\x00\x00\x00"),
+            unbundle(b"RSPR\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
             Err(BundleError::UnsupportedVersion(0xFF))
         ));
     }
 
     #[test]
     fn empty_bundle() {
-        let empty = CompressedStreams { streams: vec![] };
-        let bundled = bundle(&empty).unwrap();
-        let recovered = unbundle(&bundled).unwrap();
-        assert!(recovered.streams.is_empty());
+        let columns = crate::models::ColumnSet { columns: vec![] };
+        let compressed = compress_columns(&columns).unwrap();
+        let bundled = bundle(&compressed).unwrap();
+        let archive = unbundle(&bundled).unwrap();
+        assert!(archive.segments.is_empty());
     }
 }

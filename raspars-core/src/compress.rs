@@ -5,17 +5,23 @@ use crate::{
     models::{ColumnData, ColumnSet},
 };
 
-/// Compress a collection of columns of data into a collection of compressed streams.
-pub fn compress_columns(columns: &ColumnSet) -> Result<CompressedStreams, CompressError> {
+/// Compress all columns into a single zstd stream.
+///
+/// Serializes each column into a contiguous byte buffer, then compresses the
+/// entire buffer as one zstd frame. This gives zstd full cross-column context,
+/// eliminating per-column frame overhead and enabling better pattern matching.
+pub fn compress_columns(columns: &ColumnSet) -> Result<CompressedBundle, CompressError> {
     compress_columns_with_level(columns, DEFAULT_LEVEL)
 }
 
-/// Compress a collection of columns of data into a collection of compressed streams with a custom compression level.
+/// Compress all columns into a single zstd stream at a given compression level.
 pub fn compress_columns_with_level(
     columns: &ColumnSet,
     level: i32,
-) -> Result<CompressedStreams, CompressError> {
-    let mut streams = Vec::new();
+) -> Result<CompressedBundle, CompressError> {
+    let mut combined = Vec::new();
+    let mut segments = Vec::new();
+
     for (label, data) in &columns.columns {
         let (bytes, kind) = match data {
             ColumnData::Strings(v) => (serialize_strings(v), ColumnKind::Strings),
@@ -24,12 +30,27 @@ pub fn compress_columns_with_level(
             }
             ColumnData::StringLists(v) => (serialize_dep_lists(v), ColumnKind::StringLists),
         };
-        streams.push(compress_stream(label, kind, &bytes, level)?);
+        let offset = combined.len();
+        combined.extend_from_slice(&bytes);
+        segments.push(ColumnSegment {
+            label: label.clone(),
+            kind,
+            offset,
+            len: bytes.len(),
+        });
     }
-    Ok(CompressedStreams { streams })
+
+    let original_len = combined.len();
+    let compressed = compress_bytes(&combined, level)?;
+
+    Ok(CompressedBundle {
+        segments,
+        original_len,
+        data: compressed,
+    })
 }
 
-/// Decompress a compressed stream of data into a raw stream of data.
+/// Decompress a single zstd frame back into raw bytes.
 pub fn decompress_bytes(compressed: &[u8]) -> Result<Vec<u8>, CompressError> {
     let mut decoder = zstd::Decoder::new(compressed)?;
     let mut buf = Vec::new();
@@ -37,7 +58,7 @@ pub fn decompress_bytes(compressed: &[u8]) -> Result<Vec<u8>, CompressError> {
     Ok(buf)
 }
 
-/// Deserialize a raw stream of strings into a collection of strings.
+/// Deserialize a raw stream of newline-delimited strings.
 pub fn deserialize_strings(raw: &[u8]) -> Vec<String> {
     if raw.is_empty() {
         return Vec::new();
@@ -50,7 +71,7 @@ pub fn deserialize_strings(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Deserialize a raw stream of optional strings into a collection of optional strings.
+/// Deserialize a raw stream of newline-delimited optional strings.
 pub fn deserialize_optional_strings(raw: &[u8]) -> Vec<Option<String>> {
     if raw.is_empty() {
         return Vec::new();
@@ -69,7 +90,7 @@ pub fn deserialize_optional_strings(raw: &[u8]) -> Vec<Option<String>> {
         .collect()
 }
 
-/// Deserialize a raw stream of dependency lists into a collection of dependency lists.
+/// Deserialize a raw stream of tab-separated, newline-delimited dependency lists.
 pub fn deserialize_dep_lists(raw: &[u8]) -> Vec<Vec<String>> {
     if raw.is_empty() {
         return Vec::new();
@@ -88,8 +109,8 @@ pub fn deserialize_dep_lists(raw: &[u8]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Serialize a collection of strings into a raw stream of strings.
-fn serialize_strings(values: &[String]) -> Vec<u8> {
+/// Serialize a collection of strings as newline-delimited bytes.
+pub fn serialize_strings(values: &[String]) -> Vec<u8> {
     let mut buf = Vec::new();
     for v in values {
         buf.extend_from_slice(v.as_bytes());
@@ -98,8 +119,8 @@ fn serialize_strings(values: &[String]) -> Vec<u8> {
     buf
 }
 
-/// Serialize a collection of optional strings into a raw stream of optional strings.
-fn serialize_optional_strings(values: &[Option<String>]) -> Vec<u8> {
+/// Serialize a collection of optional strings as newline-delimited bytes.
+pub fn serialize_optional_strings(values: &[Option<String>]) -> Vec<u8> {
     let mut buf = Vec::new();
     for v in values {
         if let Some(s) = v {
@@ -110,8 +131,8 @@ fn serialize_optional_strings(values: &[Option<String>]) -> Vec<u8> {
     buf
 }
 
-/// Serialize a collection of dependency lists into a raw stream of dependency lists.
-fn serialize_dep_lists(deps: &[Vec<String>]) -> Vec<u8> {
+/// Serialize a collection of dependency lists as tab+newline delimited bytes.
+pub fn serialize_dep_lists(deps: &[Vec<String>]) -> Vec<u8> {
     let mut buf = Vec::new();
     for group in deps {
         for (i, dep) in group.iter().enumerate() {
@@ -125,27 +146,11 @@ fn serialize_dep_lists(deps: &[Vec<String>]) -> Vec<u8> {
     buf
 }
 
-/// Compress a raw stream of data into a compressed stream of data.
+/// Compress raw bytes with zstd at the given level.
 fn compress_bytes(raw: &[u8], level: i32) -> Result<Vec<u8>, CompressError> {
     let mut encoder = zstd::Encoder::new(Vec::new(), level)?;
     encoder.write_all(raw)?;
     Ok(encoder.finish()?)
-}
-
-/// Compress a raw stream of data into a compressed stream of data with a custom label.
-fn compress_stream(
-    label: impl Into<String>,
-    kind: ColumnKind,
-    raw: &[u8],
-    level: i32,
-) -> Result<CompressedStream, CompressError> {
-    let data = compress_bytes(raw, level)?;
-    Ok(CompressedStream {
-        label: label.into(),
-        kind,
-        original_len: raw.len(),
-        data,
-    })
 }
 
 /// Something went wrong while compressing or decompressing data.
@@ -155,35 +160,24 @@ pub enum CompressError {
     Compress(#[from] io::Error),
 }
 
-/// A compressed stream of data.
-pub struct CompressedStream {
+/// Metadata for a single column's position within the combined buffer.
+pub struct ColumnSegment {
     pub label: String,
     pub kind: ColumnKind,
+    pub offset: usize,
+    pub len: usize,
+}
+
+/// All columns compressed into a single zstd frame, with segment metadata.
+pub struct CompressedBundle {
+    pub segments: Vec<ColumnSegment>,
     pub original_len: usize,
     pub data: Vec<u8>,
 }
 
-impl CompressedStream {
-    pub fn ratio(&self) -> f64 {
-        if self.original_len == 0 {
-            return 0.0;
-        }
-        self.data.len() as f64 / self.original_len as f64
-    }
-}
-
-/// A collection of compressed streams of data.
-pub struct CompressedStreams {
-    pub streams: Vec<CompressedStream>,
-}
-
-impl CompressedStreams {
-    pub fn total_compressed(&self) -> usize {
-        self.streams.iter().map(|s| s.data.len()).sum()
-    }
-
-    pub fn total_original(&self) -> usize {
-        self.streams.iter().map(|s| s.original_len).sum()
+impl CompressedBundle {
+    pub fn compressed_size(&self) -> usize {
+        self.data.len()
     }
 }
 
@@ -232,26 +226,35 @@ mod tests {
     #[test]
     fn compress_columns_roundtrip() {
         let columns = construct_column_set();
-        let compressed = compress_columns(&columns).unwrap();
+        let bundle = compress_columns(&columns).unwrap();
 
-        assert_eq!(compressed.streams.len(), 6);
-        assert_eq!(compressed.streams[0].label, "header");
-        assert_eq!(compressed.streams[1].label, "names");
-        assert_eq!(compressed.streams[2].label, "versions");
-        assert_eq!(compressed.streams[3].label, "sources");
-        assert_eq!(compressed.streams[4].label, "checksums");
-        assert_eq!(compressed.streams[5].label, "dependencies");
+        assert_eq!(bundle.segments.len(), 6);
+        assert_eq!(bundle.segments[0].label, "header");
+        assert_eq!(bundle.segments[1].label, "names");
 
-        let rec_names =
-            deserialize_strings(&decompress_bytes(&compressed.streams[1].data).unwrap());
-        let rec_versions =
-            deserialize_strings(&decompress_bytes(&compressed.streams[2].data).unwrap());
-        let rec_sources =
-            deserialize_optional_strings(&decompress_bytes(&compressed.streams[3].data).unwrap());
-        let rec_checksums =
-            deserialize_optional_strings(&decompress_bytes(&compressed.streams[4].data).unwrap());
-        let rec_deps =
-            deserialize_dep_lists(&decompress_bytes(&compressed.streams[5].data).unwrap());
+        let decompressed = decompress_bytes(&bundle.data).unwrap();
+
+        let names_seg = &bundle.segments[1];
+        let raw_names = &decompressed[names_seg.offset..names_seg.offset + names_seg.len];
+        let rec_names = deserialize_strings(raw_names);
+
+        let versions_seg = &bundle.segments[2];
+        let raw_versions =
+            &decompressed[versions_seg.offset..versions_seg.offset + versions_seg.len];
+        let rec_versions = deserialize_strings(raw_versions);
+
+        let sources_seg = &bundle.segments[3];
+        let raw_sources = &decompressed[sources_seg.offset..sources_seg.offset + sources_seg.len];
+        let rec_sources = deserialize_optional_strings(raw_sources);
+
+        let checksums_seg = &bundle.segments[4];
+        let raw_checksums =
+            &decompressed[checksums_seg.offset..checksums_seg.offset + checksums_seg.len];
+        let rec_checksums = deserialize_optional_strings(raw_checksums);
+
+        let deps_seg = &bundle.segments[5];
+        let raw_deps = &decompressed[deps_seg.offset..deps_seg.offset + deps_seg.len];
+        let rec_deps = deserialize_dep_lists(raw_deps);
 
         assert_eq!(sample_names(), rec_names);
         assert_eq!(sample_versions(), rec_versions);
@@ -262,17 +265,8 @@ mod tests {
 
     #[test]
     fn compressed_is_smaller_than_original() {
-        let compressed = compress_columns(&construct_column_set()).unwrap();
-        assert!(compressed.total_compressed() < compressed.total_original());
-    }
-
-    #[test]
-    fn ratio_is_between_zero_and_one() {
-        let compressed = compress_columns(&construct_column_set()).unwrap();
-        for stream in &compressed.streams {
-            let r = stream.ratio();
-            assert!(r > 0.0, "ratio out of range: {r}");
-        }
+        let bundle = compress_columns(&construct_column_set()).unwrap();
+        assert!(bundle.compressed_size() < bundle.original_len);
     }
 
     #[test]
@@ -283,10 +277,11 @@ mod tests {
                 ("versions".into(), ColumnData::Strings(vec![])),
             ],
         };
-        let compressed = compress_columns(&columns).unwrap();
-        for stream in &compressed.streams {
-            let decompressed = decompress_bytes(&stream.data).unwrap();
-            assert!(decompressed.is_empty());
+        let bundle = compress_columns(&columns).unwrap();
+        let decompressed = decompress_bytes(&bundle.data).unwrap();
+        for seg in &bundle.segments {
+            let raw = &decompressed[seg.offset..seg.offset + seg.len];
+            assert!(raw.is_empty());
         }
     }
 }

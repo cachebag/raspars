@@ -6,23 +6,37 @@ use crate::compress::{
 use crate::models::{ColumnData, ColumnSet};
 use std::io;
 
-/// Decompress a bundled archive and reconstruct the original `Cargo.lock` file.
+/// Decompress a bundled archive back into a ColumnSet.
 ///
-/// The output will be byte-for-byte identical to the input that was originally compressed.
+/// Unbundles the header to get segment metadata, decompresses the single zstd
+/// frame, then slices out each column's bytes and deserializes them.
 pub fn decompress_archive(archive: &[u8]) -> Result<ColumnSet, DecompressError> {
-    let streams = unbundle(archive)?;
+    let unbundled = unbundle(archive)?;
+    let decompressed = decompress_bytes(&unbundled.compressed_data)?;
     let mut columns = Vec::new();
 
-    for stream in &streams.streams {
-        let bytes = decompress_bytes(&stream.data)?;
-        let data = match stream.kind {
-            ColumnKind::Strings => ColumnData::Strings(deserialize_strings(&bytes)),
+    for seg in &unbundled.segments {
+        if seg.offset + seg.len > decompressed.len() {
+            return Err(DecompressError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "segment '{}' out of bounds: offset={} len={} total={}",
+                    seg.label,
+                    seg.offset,
+                    seg.len,
+                    decompressed.len()
+                ),
+            )));
+        }
+        let raw = &decompressed[seg.offset..seg.offset + seg.len];
+        let data = match seg.kind {
+            ColumnKind::Strings => ColumnData::Strings(deserialize_strings(raw)),
             ColumnKind::OptionalStrings => {
-                ColumnData::OptionalStrings(deserialize_optional_strings(&bytes))
+                ColumnData::OptionalStrings(deserialize_optional_strings(raw))
             }
-            ColumnKind::StringLists => ColumnData::StringLists(deserialize_dep_lists(&bytes)),
+            ColumnKind::StringLists => ColumnData::StringLists(deserialize_dep_lists(raw)),
         };
-        columns.push((stream.label.clone(), data));
+        columns.push((seg.label.clone(), data));
     }
 
     Ok(ColumnSet { columns })
