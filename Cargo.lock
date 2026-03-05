@@ -225,6 +225,9 @@ dependencies = [
 [[package]]
 name = "raspars-formats"
 version = "0.1.0"
+dependencies = [
+ "raspars-core",
+]
 
 [[package]]
 name = "shlex"
