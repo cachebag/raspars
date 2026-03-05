@@ -1,6 +1,4 @@
-<h2 align="center">raspars</h2>
-
-<p align="center"><strong>Smarter compression for developer artifacts</strong></p>
+<h1 align="center">raspars</h1>
 
 raspars is a structure-aware compression tool for developer artifacts that 
 outperforms generic compressors by exploiting known file formats before encoding.
