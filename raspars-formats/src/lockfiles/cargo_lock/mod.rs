@@ -1,4 +1,53 @@
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
+
+use raspars_core::models::{ColumnData, ColumnSet};
+
+use super::format::LockfileFormat;
+
+pub struct CargoLock;
+
+impl LockfileFormat for CargoLock {
+    fn parse_to_columns(input: &[u8]) -> Result<ColumnSet, io::Error> {
+        let streams = parse(io::Cursor::new(input))?;
+        Ok(streams.into_column_set())
+    }
+
+    fn reconstruct(columns: ColumnSet) -> Result<Vec<u8>, io::Error> {
+        let streams = CargoLockStreams::from_column_set(&columns);
+        let mut output = Vec::new();
+
+        output.extend_from_slice(streams.header.as_bytes());
+        if !streams.header.is_empty() && !streams.header.ends_with('\n') {
+            writeln!(output)?;
+        }
+
+        for i in 0..streams.names.len() {
+            writeln!(output)?;
+            writeln!(output, "[[package]]")?;
+            writeln!(output, "name = \"{}\"", streams.names[i])?;
+            writeln!(output, "version = \"{}\"", streams.versions[i])?;
+
+            if let Some(source) = &streams.sources[i] {
+                writeln!(output, "source = \"{}\"", source)?;
+            }
+
+            if let Some(checksum) = &streams.checksums[i] {
+                writeln!(output, "checksum = \"{}\"", checksum)?;
+            }
+
+            if !streams.dependencies[i].is_empty() {
+                let deps = &streams.dependencies[i];
+                writeln!(output, "dependencies = [")?;
+                for dep in deps {
+                    writeln!(output, " \"{}\",", dep)?;
+                }
+                writeln!(output, "]")?;
+            }
+        }
+
+        Ok(output)
+    }
+}
 
 /// Parse a Cargo.lock file into a stream of packages.
 /// Files could be thousands, if not millions of lines long.
@@ -143,6 +192,48 @@ pub struct CargoLockStreams {
     pub dependencies: Vec<Vec<String>>,
 }
 
+impl CargoLockStreams {
+    pub fn into_column_set(self) -> ColumnSet {
+        ColumnSet {
+            columns: vec![
+                (
+                    "header".into(),
+                    ColumnData::Strings(self.header.lines().map(String::from).collect()),
+                ),
+                ("names".into(), ColumnData::Strings(self.names)),
+                ("versions".into(), ColumnData::Strings(self.versions)),
+                ("sources".into(), ColumnData::OptionalStrings(self.sources)),
+                (
+                    "checksums".into(),
+                    ColumnData::OptionalStrings(self.checksums),
+                ),
+                (
+                    "dependencies".into(),
+                    ColumnData::StringLists(self.dependencies),
+                ),
+            ],
+        }
+    }
+
+    pub fn from_column_set(columns: &ColumnSet) -> Self {
+        let mut streams = CargoLockStreams::default();
+        for (label, data) in &columns.columns {
+            match (label.as_str(), data) {
+                ("header", ColumnData::Strings(v)) => {
+                    streams.header = v.join("\n");
+                }
+                ("names", ColumnData::Strings(v)) => streams.names = v.clone(),
+                ("versions", ColumnData::Strings(v)) => streams.versions = v.clone(),
+                ("sources", ColumnData::OptionalStrings(v)) => streams.sources = v.clone(),
+                ("checksums", ColumnData::OptionalStrings(v)) => streams.checksums = v.clone(),
+                ("dependencies", ColumnData::StringLists(v)) => streams.dependencies = v.clone(),
+                _ => {}
+            }
+        }
+        streams
+    }
+}
+
 /// A builder for a package in a Cargo.lock file.
 #[derive(Debug, Clone, Default)]
 struct PackageBuilder {
@@ -169,7 +260,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    const FIXTURE: &str = include_str!("../../tests/fixtures/Cargo.lock");
+    const FIXTURE: &str = include_str!("../../../tests/fixtures/Cargo.lock");
 
     fn fixture_streams() -> CargoLockStreams {
         parse(Cursor::new(FIXTURE)).unwrap()
