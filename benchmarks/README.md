@@ -27,6 +27,8 @@ Last updated: 2026-03-05
 
 Compression level: zstd default (level 3) for both.
 
+**Note on typescript:** This fixture uses lockfileVersion 2, a transitional format from npm v7–v8 that includes a legacy `dependencies` block alongside `packages`. The `dependencies` block accounts for ~98% of the file and is passed through as a raw blob (not columnized). npm v9+ (Node 18+) defaults to lockfileVersion 3 which drops `dependencies` entirely — see babylon.js and vscode for v3 results. Columnar provides no benefit for this fixture.
+
 ## Fixtures
 
 Lockfiles sourced from open-source projects:
