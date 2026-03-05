@@ -6,3 +6,5 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+zstd.workspace = true
+thiserror.workspace = true
