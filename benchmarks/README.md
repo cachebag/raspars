@@ -1,6 +1,6 @@
 # Benchmarks
 
-Compares raspars (columnar + zstd) against plain zstd on real-world `Cargo.lock` files.
+Compares raspars (columnar + zstd) against plain zstd on lockfiles from various open-source projects.
 
 ## Usage
 
@@ -11,26 +11,35 @@ bash benchmarks/bench.sh
 
 ## Results
 
-All fixtures roundtrip byte-perfectly.
+Last updated: 2026-03-05
 
-| project    | original | zstd  | raspars | zstd % | raspars % |
-|------------|----------|-------|---------|--------|-----------|
-| ripgrep    | 12K      | 3K    | 3K      | 26.6%  | 24.8%     |
-| nmrs       | 45K      | 10K   | 9K      | 23.7%  | 21.0%     |
-| alacritty  | 70K      | 16K   | 14K     | 23.5%  | 20.7%     |
-| rustup     | 93K      | 22K   | 19K     | 23.5%  | 20.3%     |
-| rustc      | 150K     | 35K   | 28K     | 23.4%  | 19.0%     |
-| servo      | 277K     | 61K   | 52K     | 22.1%  | 18.9%     |
+| project | file | original | zstd | raspars | zstd % | raspars % |
+|---------|------|----------|------|---------|--------|-----------|
+| alacritty | Cargo.lock | 70K | 16K | 14K | 23.5% | 21.1% |
+| babylon.js | package-lock.json | 1100K | 191K | 175K | 17.4% | 15.9% |
+| nmrs | Cargo.lock | 45K | 10K | 9K | 23.7% | 21.3% |
+| ripgrep | Cargo.lock | 12K | 3K | 3K | 26.6% | 24.3% |
+| rustc | Cargo.lock | 150K | 35K | 29K | 23.4% | 19.5% |
+| rustup | Cargo.lock | 93K | 22K | 19K | 23.5% | 20.9% |
+| servo | Cargo.lock | 277K | 61K | 53K | 22.1% | 19.4% |
+| typescript | package-lock.json | 360K | 50K | 52K | 14.1% | 14.7% |
+| vscode | package-lock.json | 758K | 160K | 151K | 21.2% | 19.9% |
 
 Compression level: zstd default (level 3) for both.
 
 ## Fixtures
 
-Lockfiles sourced from open-source Rust projects:
+Lockfiles sourced from open-source projects:
 
+**Cargo.lock** — Rust ecosystem
 - **ripgrep** — small CLI tool
-- **nmrs** — medium project
+- **nmrs** — Rust bindings for NetworkManager
 - **alacritty** — terminal emulator
 - **rustup** — Rust toolchain manager
 - **rustc** — the Rust compiler
 - **servo** — web browser engine
+
+**package-lock.json** — npm ecosystem
+- **typescript** — TypeScript compiler (lockfileVersion 2)
+- **vscode** — Visual Studio Code (lockfileVersion 3)
+- **babylon.js** — 3D engine (lockfileVersion 3)
