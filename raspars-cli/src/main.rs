@@ -7,9 +7,9 @@ use raspars_core::bundle;
 use raspars_core::compress::compress_columns;
 use raspars_core::decompress::decompress_archive;
 use raspars_core::models::ColumnSet;
-use raspars_formats::lockfiles::cargo_lock::CargoLock;
-use raspars_formats::lockfiles::format::LockfileFormat;
-use raspars_formats::lockfiles::package_lock::PackageLock;
+use raspars_formats::lockfiles::{
+    cargo_lock::CargoLock, format::LockfileFormat, package_lock::PackageLock, pnpm_lock::PnpmLock,
+};
 
 #[derive(Parser)]
 #[command(name = "raspars")]
@@ -26,32 +26,36 @@ enum Commands {
 }
 
 /// Supported lockfile formats, detected from filename.
-enum Format {
-    CargoLock,
-    PackageLock,
+enum LockfileKind {
+    Cargo,
+    Npm,
+    Pnpm,
 }
 
-fn detect_format(path: &Path) -> Result<Format> {
+fn detect_format(path: &Path) -> Result<LockfileKind> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     match name {
-        "Cargo.lock" => Ok(Format::CargoLock),
-        "package-lock.json" => Ok(Format::PackageLock),
+        "Cargo.lock" => Ok(LockfileKind::Cargo),
+        "package-lock.json" => Ok(LockfileKind::Npm),
+        "pnpm-lock.yaml" | "pnpm-lockfile.yml" => Ok(LockfileKind::Pnpm),
         _ => bail!("unsupported file format: {name}"),
     }
 }
 
-fn parse_to_columns(format: &Format, data: &[u8]) -> Result<ColumnSet> {
-    let columns = match format {
-        Format::CargoLock => CargoLock::parse_to_columns(data)?,
-        Format::PackageLock => PackageLock::parse_to_columns(data)?,
+fn parse_to_columns(kind: &LockfileKind, data: &[u8]) -> Result<ColumnSet> {
+    let columns = match kind {
+        LockfileKind::Cargo => CargoLock::parse_to_columns(data)?,
+        LockfileKind::Npm => PackageLock::parse_to_columns(data)?,
+        LockfileKind::Pnpm => PnpmLock::parse_to_columns(data)?,
     };
     Ok(columns)
 }
 
-fn reconstruct(format: &Format, columns: ColumnSet) -> Result<Vec<u8>> {
-    let bytes = match format {
-        Format::CargoLock => CargoLock::reconstruct(columns)?,
-        Format::PackageLock => PackageLock::reconstruct(columns)?,
+fn reconstruct(kind: &LockfileKind, columns: ColumnSet) -> Result<Vec<u8>> {
+    let bytes = match kind {
+        LockfileKind::Cargo => CargoLock::reconstruct(columns)?,
+        LockfileKind::Npm => PackageLock::reconstruct(columns)?,
+        LockfileKind::Pnpm => PnpmLock::reconstruct(columns)?,
     };
     Ok(bytes)
 }
